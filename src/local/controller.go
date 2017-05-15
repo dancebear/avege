@@ -6,16 +6,17 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"sort"
+	"runtime"
 	"strconv"
 	"time"
 
 	"common"
 	"common/cache"
+	"config"
 	"github.com/gin-gonic/gin"
 	"github.com/kardianos/osext"
-	"runtime"
 	"inbound"
+	"rule"
 )
 
 var (
@@ -50,8 +51,8 @@ func clearDNSCache(c *gin.Context) {
 
 func updateIptablesRulesHandler(c *gin.Context) {
 	if runtime.GOOS == "linux" {
-		if inbound.IsInBoundModeEnabled("redir") {
-			go updateRedirFirewallRules()
+		if inbound.IsModeEnabled("redir") {
+			go rule.UpdateRedirFirewallRules()
 			c.JSON(http.StatusOK, gin.H{
 				"Result": "OK",
 			})
@@ -70,7 +71,7 @@ func updateIptablesRulesHandler(c *gin.Context) {
 func getTokenHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"Result": "OK",
-		"Token":  config.Generals.Token,
+		"Token":  config.Configurations.Generals.Token,
 	})
 }
 
@@ -84,9 +85,9 @@ func getSelectServerHandler(c *gin.Context) {
 	if smartLastUsedBackendInfo != nil && smartLastUsedBackendInfo.id == id {
 		return
 	}
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	for server := range Statistics.StatisticMap {
+	statistics.RLock()
+	defer statistics.RUnlock()
+	for server := range statistics.StatisticMap {
 		if server.id == id {
 			smartLastUsedBackendInfo = server
 			return
@@ -108,9 +109,9 @@ func postSelectServerHandler(c *gin.Context) {
 		})
 		return
 	}
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	for server := range Statistics.StatisticMap {
+	statistics.RLock()
+	defer statistics.RUnlock()
+	for server := range statistics.StatisticMap {
 		if server.id == id {
 			smartLastUsedBackendInfo = server
 			c.JSON(http.StatusOK, gin.H{
@@ -136,7 +137,7 @@ func forceUpdateSmartUsedServerInfoHandler(c *gin.Context) {
 func getMethodHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"Result": "OK",
-		"Msg":    defaultMethod,
+		"Msg":    config.DefaultMethod,
 	})
 }
 
@@ -148,29 +149,38 @@ func setMethodHandler(c *gin.Context) {
 		})
 		return
 	}
-	switch methodStr {
-	case "aes-128-cfb":
-	case "aes-192-cfb":
-	case "aes-256-cfb":
-	case "des-cfb":
-	case "bf-cfb":
-	case "cast5-cfb":
-	case "rc4-md5":
-	case "chacha20":
-	case "salsa20":
-	case "camellia-128-cfb":
-	case "camellia-192-cfb":
-	case "camellia-256-cfb":
-	case "idea-cfb":
-	case "rc2-cfb":
-	case "seed-cfb":
-	default:
+	methodMap := map[string]bool{
+		"aes-128-cfb":      true,
+		"aes-256-cfb":      true,
+		"aes-192-cfb":      true,
+		"aes-128-ctr":      true,
+		"aes-256-ctr":      true,
+		"aes-192-ctr":      true,
+		"aes-128-ofb":      true,
+		"aes-256-ofb":      true,
+		"aes-192-ofb":      true,
+		"des-cfb":          true,
+		"bf-cfb":           true,
+		"cast5-cfb":        true,
+		"rc4-md5":          true,
+		"chacha20":         true,
+		"chacha20-ietf":    true,
+		"salsa20":          true,
+		"camellia-128-cfb": true,
+		"camellia-192-cfb": true,
+		"camellia-256-cfb": true,
+		"idea-cfb":         true,
+		"rc2-cfb":          true,
+		"seed-cfb":         true,
+	}
+	_, ok := methodMap[methodStr]
+	if !ok {
 		c.JSON(http.StatusOK, gin.H{
 			"Result": fmt.Sprintf("unsupported method %s", methodStr),
 		})
 		return
 	}
-	defaultMethod = methodStr
+	config.DefaultMethod = methodStr
 	c.JSON(http.StatusOK, gin.H{
 		"Result": "OK",
 	})
@@ -179,7 +189,7 @@ func setMethodHandler(c *gin.Context) {
 func getKeyHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"Result": "OK",
-		"Msg":    defaultKey,
+		"Msg":    config.DefaultKey,
 	})
 }
 
@@ -192,7 +202,7 @@ func setKeyHandler(c *gin.Context) {
 		return
 	}
 
-	defaultKey = keyStr
+	config.DefaultKey = keyStr
 	c.JSON(http.StatusOK, gin.H{
 		"Result": "OK",
 	})
@@ -201,7 +211,7 @@ func setKeyHandler(c *gin.Context) {
 func getPortHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"Result": "OK",
-		"Msg":    defaultPort,
+		"Msg":    config.DefaultPort,
 	})
 }
 
@@ -229,7 +239,7 @@ func setPortHandler(c *gin.Context) {
 		return
 	}
 
-	defaultPort = portStr
+	config.DefaultPort = portStr
 	c.JSON(http.StatusOK, gin.H{
 		"Result": "OK",
 	})
@@ -264,32 +274,41 @@ func addServerFullHandler(c *gin.Context) {
 		})
 		return
 	}
-	switch methodStr {
-	case "aes-128-cfb":
-	case "aes-192-cfb":
-	case "aes-256-cfb":
-	case "des-cfb":
-	case "bf-cfb":
-	case "cast5-cfb":
-	case "rc4-md5":
-	case "chacha20":
-	case "salsa20":
-	case "camellia-128-cfb":
-	case "camellia-192-cfb":
-	case "camellia-256-cfb":
-	case "idea-cfb":
-	case "rc2-cfb":
-	case "seed-cfb":
-	default:
+	methodMap := map[string]bool{
+		"aes-128-cfb":      true,
+		"aes-256-cfb":      true,
+		"aes-192-cfb":      true,
+		"aes-128-ctr":      true,
+		"aes-256-ctr":      true,
+		"aes-192-ctr":      true,
+		"aes-128-ofb":      true,
+		"aes-256-ofb":      true,
+		"aes-192-ofb":      true,
+		"des-cfb":          true,
+		"bf-cfb":           true,
+		"cast5-cfb":        true,
+		"rc4-md5":          true,
+		"chacha20":         true,
+		"chacha20-ietf":    true,
+		"salsa20":          true,
+		"camellia-128-cfb": true,
+		"camellia-192-cfb": true,
+		"camellia-256-cfb": true,
+		"idea-cfb":         true,
+		"rc2-cfb":          true,
+		"seed-cfb":         true,
+	}
+	_, ok := methodMap[methodStr]
+	if !ok {
 		c.JSON(http.StatusOK, gin.H{
 			"Result": fmt.Sprintf("unsupported method %s", methodStr),
 		})
 		return
 	}
 
-	defaultPort = portStr
-	defaultKey = keyStr
-	defaultMethod = methodStr
+	config.DefaultPort = portStr
+	config.DefaultKey = keyStr
+	config.DefaultMethod = methodStr
 	addServer(address)
 	c.JSON(http.StatusOK, gin.H{
 		"Result": "OK",
@@ -383,10 +402,10 @@ type Report struct {
 	Stats
 }
 
-func statisticsXMLHandler(c *gin.Context) {
+func createStats(order string, orderBy string) Stats {
 	stats := make(Stats, 0)
-	Statistics.RLock()
-	for backendInfo, stat := range Statistics.StatisticMap {
+	statistics.RLock()
+	for backendInfo, stat := range statistics.StatisticMap {
 		s := new(Stat)
 		s.Id = backendInfo.id
 		s.Address = backendInfo.address
@@ -405,374 +424,77 @@ func statisticsXMLHandler(c *gin.Context) {
 		s.LastSecondBps = stat.GetLastSecondBps()
 		stats = append(stats, s)
 	}
-	Statistics.RUnlock()
-	order := c.DefaultQuery("order", "asc")
-	orderBy := c.DefaultQuery("orderby", "address")
-	switch orderBy {
-	case "failedcount":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byFailedCount{stats}))
-		} else {
-			sort.Sort(byFailedCount{stats})
-		}
-	case "latency":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLatency{stats}))
-		} else {
-			sort.Sort(byLatency{stats})
-		}
-	case "download":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byTotalDownload{stats}))
-		} else {
-			sort.Sort(byTotalDownload{stats})
-		}
-	case "upload":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byTotalUpload{stats}))
-		} else {
-			sort.Sort(byTotalUpload{stats})
-		}
-	case "highestlasthourbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastHourBps{stats}))
-		} else {
-			sort.Sort(byHighestLastHourBps{stats})
-		}
-	case "highestlasttenminutesbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastTenMinutesBps{stats}))
-		} else {
-			sort.Sort(byHighestLastTenMinutesBps{stats})
-		}
-	case "highestlastminutebps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastMinuteBps{stats}))
-		} else {
-			sort.Sort(byHighestLastMinuteBps{stats})
-		}
-	case "highestlastsecondbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastSecondBps{stats}))
-		} else {
-			sort.Sort(byHighestLastSecondBps{stats})
-		}
-	case "lasthourbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastHourBps{stats}))
-		} else {
-			sort.Sort(byLastHourBps{stats})
-		}
-	case "lasttenminutesbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastTenMinutesBps{stats}))
-		} else {
-			sort.Sort(byLastTenMinutesBps{stats})
-		}
-	case "lastminutebps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastMinuteBps{stats}))
-		} else {
-			sort.Sort(byLastMinuteBps{stats})
-		}
-	case "lastsecondbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastSecondBps{stats}))
-		} else {
-			sort.Sort(byLastSecondBps{stats})
-		}
-	case "protocol":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byProtocolType{stats}))
-		} else {
-			sort.Sort(byProtocolType{stats})
-		}
-	case "address":
-		fallthrough
-	default:
-		if order == "desc" {
-			sort.Sort(sort.Reverse(stats))
-		} else {
-			sort.Sort(stats)
-		}
-	}
+	statistics.RUnlock()
+	orderStats(order, orderBy, stats)
+	return stats
+}
+
+func createReport(order string, orderBy string) *Report {
+	stats := createStats(order, orderBy)
 	currentUsing := "nil"
 	if smartLastUsedBackendInfo != nil {
 		currentUsing = smartLastUsedBackendInfo.address
 	}
-	c.XML(http.StatusOK, Report{
+	return &Report{
 		Stats:         stats,
 		TotalDownload: common.TotalStat.GetDownload(),
 		TotalUpload:   common.TotalStat.GetUpload(),
-		Quote:         leftQuote,
+		Quote:         config.LeftQuote,
 		CurrentUsing:  currentUsing,
 		StartAt:       startAt,
 		Uptime:        time.Now().Sub(startAt).String(),
-	})
+	}
 }
 
-func statisticsJSONHandler(c *gin.Context) {
-	stats := make(Stats, 0)
-	Statistics.RLock()
-	for backendInfo, stat := range Statistics.StatisticMap {
-		s := new(Stat)
-		s.Id = backendInfo.id
-		s.Address = backendInfo.address
-		s.ProtocolType = backendInfo.protocolType
-		s.FailedCount = stat.GetFailedCount()
-		s.Latency = stat.GetLatency()
-		s.TotalDownload = stat.GetTotalDownload()
-		s.TotalUpload = stat.GetTotalUploaded()
-		s.HighestLastHourBps = stat.GetHighestLastHourBps()
-		s.HighestLastTenMinutesBps = stat.GetHighestLastTenMinutesBps()
-		s.HighestLastMinuteBps = stat.GetHighestLastMinuteBps()
-		s.HighestLastSecondBps = stat.GetHighestLastSecondBps()
-		s.LastHourBps = stat.GetLastHourBps()
-		s.LastTenMinutesBps = stat.GetLastTenMinutesBps()
-		s.LastMinuteBps = stat.GetLastMinuteBps()
-		s.LastSecondBps = stat.GetLastSecondBps()
-		stats = append(stats, s)
-	}
-	Statistics.RUnlock()
-	order := c.DefaultQuery("order", "asc")
-	orderBy := c.DefaultQuery("orderby", "address")
-	switch orderBy {
-	case "failedcount":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byFailedCount{stats}))
-		} else {
-			sort.Sort(byFailedCount{stats})
-		}
-	case "latency":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLatency{stats}))
-		} else {
-			sort.Sort(byLatency{stats})
-		}
-	case "download":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byTotalDownload{stats}))
-		} else {
-			sort.Sort(byTotalDownload{stats})
-		}
-	case "upload":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byTotalUpload{stats}))
-		} else {
-			sort.Sort(byTotalUpload{stats})
-		}
-	case "highestlasthourbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastHourBps{stats}))
-		} else {
-			sort.Sort(byHighestLastHourBps{stats})
-		}
-	case "highestlasttenminutesbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastTenMinutesBps{stats}))
-		} else {
-			sort.Sort(byHighestLastTenMinutesBps{stats})
-		}
-	case "highestlastminutebps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastMinuteBps{stats}))
-		} else {
-			sort.Sort(byHighestLastMinuteBps{stats})
-		}
-	case "highestlastsecondbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastSecondBps{stats}))
-		} else {
-			sort.Sort(byHighestLastSecondBps{stats})
-		}
-	case "lasthourbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastHourBps{stats}))
-		} else {
-			sort.Sort(byLastHourBps{stats})
-		}
-	case "lasttenminutesbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastTenMinutesBps{stats}))
-		} else {
-			sort.Sort(byLastTenMinutesBps{stats})
-		}
-	case "lastminutebps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastMinuteBps{stats}))
-		} else {
-			sort.Sort(byLastMinuteBps{stats})
-		}
-	case "lastsecondbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastSecondBps{stats}))
-		} else {
-			sort.Sort(byLastSecondBps{stats})
-		}
-	case "protocol":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byProtocolType{stats}))
-		} else {
-			sort.Sort(byProtocolType{stats})
-		}
-	case "address":
-		fallthrough
-	default:
-		if order == "desc" {
-			sort.Sort(sort.Reverse(stats))
-		} else {
-			sort.Sort(stats)
-		}
-	}
+func createGinH(order string, orderBy string) *gin.H {
+	stats := createStats(order, orderBy)
 	currentUsing := "nil"
 	if smartLastUsedBackendInfo != nil {
 		currentUsing = smartLastUsedBackendInfo.address
 	}
-	c.JSON(http.StatusOK, Report{
-		Stats:         stats,
-		TotalDownload: common.TotalStat.GetDownload(),
-		TotalUpload:   common.TotalStat.GetUpload(),
-		Quote:         leftQuote,
-		CurrentUsing:  currentUsing,
-		StartAt:       startAt,
-		Uptime:        time.Now().Sub(startAt).String(),
-	})
-}
-
-func statisticsHTMLHandler(c *gin.Context) {
-	stats := make(Stats, 0)
-	Statistics.RLock()
-	for backendInfo, stat := range Statistics.StatisticMap {
-		s := new(Stat)
-		s.Id = backendInfo.id
-		s.Address = backendInfo.address
-		s.ProtocolType = backendInfo.protocolType
-		s.FailedCount = stat.GetFailedCount()
-		s.Latency = stat.GetLatency() / 1000000
-		s.TotalDownload = stat.GetTotalDownload() / 1000000
-		s.TotalUpload = stat.GetTotalUploaded() / 1000000
-		s.HighestLastHourBps = stat.GetHighestLastHourBps() / 1000
-		s.HighestLastTenMinutesBps = stat.GetHighestLastTenMinutesBps() / 1000
-		s.HighestLastMinuteBps = stat.GetHighestLastMinuteBps() / 1000
-		s.HighestLastSecondBps = stat.GetHighestLastSecondBps() / 1000
-		s.LastHourBps = stat.GetLastHourBps()
-		s.LastTenMinutesBps = stat.GetLastTenMinutesBps()
-		s.LastMinuteBps = stat.GetLastMinuteBps()
-		s.LastSecondBps = stat.GetLastSecondBps()
-		stats = append(stats, s)
+	newOrders := map[string]string{
+		"asc":  "desc",
+		"desc": "asc",
 	}
-	Statistics.RUnlock()
-	order := c.DefaultQuery("order", "asc")
-	orderBy := c.DefaultQuery("orderby", "address")
-	switch orderBy {
-	case "failedcount":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byFailedCount{stats}))
-		} else {
-			sort.Sort(byFailedCount{stats})
-		}
-	case "latency":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLatency{stats}))
-		} else {
-			sort.Sort(byLatency{stats})
-		}
-	case "download":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byTotalDownload{stats}))
-		} else {
-			sort.Sort(byTotalDownload{stats})
-		}
-	case "upload":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byTotalUpload{stats}))
-		} else {
-			sort.Sort(byTotalUpload{stats})
-		}
-	case "highestlasthourbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastHourBps{stats}))
-		} else {
-			sort.Sort(byHighestLastHourBps{stats})
-		}
-	case "highestlasttenminutesbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastTenMinutesBps{stats}))
-		} else {
-			sort.Sort(byHighestLastTenMinutesBps{stats})
-		}
-	case "highestlastminutebps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastMinuteBps{stats}))
-		} else {
-			sort.Sort(byHighestLastMinuteBps{stats})
-		}
-	case "highestlastsecondbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byHighestLastSecondBps{stats}))
-		} else {
-			sort.Sort(byHighestLastSecondBps{stats})
-		}
-	case "lasthourbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastHourBps{stats}))
-		} else {
-			sort.Sort(byLastHourBps{stats})
-		}
-	case "lasttenminutesbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastTenMinutesBps{stats}))
-		} else {
-			sort.Sort(byLastTenMinutesBps{stats})
-		}
-	case "lastminutebps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastMinuteBps{stats}))
-		} else {
-			sort.Sort(byLastMinuteBps{stats})
-		}
-	case "lastsecondbps":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byLastSecondBps{stats}))
-		} else {
-			sort.Sort(byLastSecondBps{stats})
-		}
-	case "protocol":
-		if order == "desc" {
-			sort.Sort(sort.Reverse(byProtocolType{stats}))
-		} else {
-			sort.Sort(byProtocolType{stats})
-		}
-	case "address":
-		fallthrough
-	default:
-		if order == "desc" {
-			sort.Sort(sort.Reverse(stats))
-		} else {
-			sort.Sort(stats)
-		}
-	}
-	currentUsing := "nil"
-	if smartLastUsedBackendInfo != nil {
-		currentUsing = smartLastUsedBackendInfo.address
-	}
-	var newOrder string
-	if order == "asc" {
-		newOrder = "desc"
-	} else {
-		newOrder = "asc"
-	}
-
-	c.HTML(http.StatusOK, "index.tmpl", gin.H{
+	return &gin.H{
 		"title":         "avege, a powerful anti-GFW toolset",
 		"stats":         stats,
 		"currentUsing":  currentUsing,
 		"totalDownload": common.TotalStat.GetDownload(),
 		"totalUpload":   common.TotalStat.GetUpload(),
-		"quote":         leftQuote,
+		"quote":         config.LeftQuote,
 		"startAt":       startAt,
 		"uptime":        time.Now().Sub(startAt).String(),
-		"order":         newOrder,
+		"order":         newOrders[order],
 		"next":          url.QueryEscape(fmt.Sprintf("orderby=%s&order=%s", orderBy, order)),
-	})
+	}
+}
+
+func statisticsXMLHandler(c *gin.Context) {
+	order := c.DefaultQuery("order", "asc")
+	orderBy := c.DefaultQuery("orderby", "address")
+	r := createReport(order, orderBy)
+	c.XML(http.StatusOK, *r)
+}
+
+func statisticsJSONHandler(c *gin.Context) {
+	order := c.DefaultQuery("order", "asc")
+	orderBy := c.DefaultQuery("orderby", "address")
+	r := createReport(order, orderBy)
+	c.JSON(http.StatusOK, *r)
+}
+
+func statisticsHTMLHandler(c *gin.Context) {
+	order := c.DefaultQuery("order", "asc")
+	orderBy := c.DefaultQuery("orderby", "address")
+	h := createGinH(order, orderBy)
+	c.HTML(http.StatusOK, "index.tmpl", *h)
+}
+
+func orderStats(order string, orderBy string, stats Stats) {
+	if sorter, ok := statsSortMap[orderBy]; ok {
+		sorter(order, stats)
+	} else {
+		orderByAddress(order, stats)
+	}
 }

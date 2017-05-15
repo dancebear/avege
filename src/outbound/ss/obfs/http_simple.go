@@ -37,7 +37,7 @@ var (
 )
 
 // HttpSimple http_simple obfs encapsulate
-type HttpSimplePost struct {
+type httpSimplePost struct {
 	ssr.ServerInfoForObfs
 	rawTransSent     bool
 	rawTransReceived bool
@@ -45,9 +45,13 @@ type HttpSimplePost struct {
 	getOrPost        bool // true for get, false for post
 }
 
-// NewHttpSimple create a http_simple object
-func NewHttpSimple() *HttpSimplePost {
-	t := &HttpSimplePost{
+func init() {
+	register("http_simple", newHttpSimple)
+}
+
+// newHttpSimple create a http_simple object
+func newHttpSimple() IObfs {
+	t := &httpSimplePost{
 		rawTransSent:     false,
 		rawTransReceived: false,
 		userAgentIndex:   rand.Intn(len(requestUserAgent)),
@@ -56,23 +60,23 @@ func NewHttpSimple() *HttpSimplePost {
 	return t
 }
 
-func (t *HttpSimplePost) SetServerInfo(s *ssr.ServerInfoForObfs) {
+func (t *httpSimplePost) SetServerInfo(s *ssr.ServerInfoForObfs) {
 	t.ServerInfoForObfs = *s
 }
 
-func (t *HttpSimplePost) GetServerInfo() (s *ssr.ServerInfoForObfs) {
+func (t *httpSimplePost) GetServerInfo() (s *ssr.ServerInfoForObfs) {
 	return &t.ServerInfoForObfs
 }
 
-func (t *HttpSimplePost) SetData(data interface{}) {
+func (t *httpSimplePost) SetData(data interface{}) {
 
 }
 
-func (t *HttpSimplePost) GetData() interface{} {
+func (t *httpSimplePost) GetData() interface{} {
 	return nil
 }
 
-func (t *HttpSimplePost) boundary() (ret string) {
+func (t *httpSimplePost) boundary() (ret string) {
 	set := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 	for i := 0; i < 32; i++ {
 		ret = fmt.Sprintf("%s%c", ret, set[rand.Intn(len(set))])
@@ -80,14 +84,14 @@ func (t *HttpSimplePost) boundary() (ret string) {
 	return
 }
 
-func (t *HttpSimplePost) data2URLEncode(data []byte) (ret string) {
+func (t *httpSimplePost) data2URLEncode(data []byte) (ret string) {
 	for i := 0; i < len(data); i++ {
 		ret = fmt.Sprintf("%s%%%s", ret, hex.EncodeToString([]byte{data[i]}))
 	}
 	return
 }
 
-func (t *HttpSimplePost) Encode(data []byte) (encodedData []byte, err error) {
+func (t *httpSimplePost) Encode(data []byte) (encodedData []byte, err error) {
 	if t.rawTransSent {
 		return data, nil
 	}
@@ -95,12 +99,12 @@ func (t *HttpSimplePost) Encode(data []byte) (encodedData []byte, err error) {
 	dataLength := len(data)
 	var headData []byte
 	if headSize := t.IVLen + t.HeadLen; dataLength-headSize > 64 {
-		headData = make([]byte, headSize + rand.Intn(64))
+		headData = make([]byte, headSize+rand.Intn(64))
 	} else {
 		headData = make([]byte, dataLength)
 	}
 	copy(headData, data[0:len(headData)])
-	requestPathIndex := rand.Intn(len(requestPath) / 2) * 2
+	requestPathIndex := rand.Intn(len(requestPath)/2) * 2
 	host := t.Host
 	var customHead string
 
@@ -127,7 +131,7 @@ func (t *HttpSimplePost) Encode(data []byte) (encodedData []byte, err error) {
 		method,
 		requestPath[requestPathIndex],
 		t.data2URLEncode(headData),
-		requestPath[requestPathIndex + 1],
+		requestPath[requestPathIndex+1],
 		host,
 		t.Port)
 	if len(customHead) > 0 {
@@ -149,7 +153,7 @@ func (t *HttpSimplePost) Encode(data []byte) (encodedData []byte, err error) {
 	}
 
 	if len(headData) < dataLength {
-		encodedData = make([]byte, len(httpBuf) + (dataLength - len(headData)))
+		encodedData = make([]byte, len(httpBuf)+(dataLength-len(headData)))
 		copy(encodedData, []byte(httpBuf))
 		copy(encodedData[len(httpBuf):], data[len(headData):])
 	} else {
@@ -160,15 +164,15 @@ func (t *HttpSimplePost) Encode(data []byte) (encodedData []byte, err error) {
 	return
 }
 
-func (t *HttpSimplePost) Decode(data []byte) (decodedData []byte, needSendBack bool, err error) {
+func (t *httpSimplePost) Decode(data []byte) (decodedData []byte, needSendBack bool, err error) {
 	if t.rawTransReceived {
 		return data, false, nil
 	}
 
 	pos := bytes.Index(data, []byte("\r\n\r\n"))
 	if pos > 0 {
-		decodedData = make([]byte, len(data) - pos - 4)
-		copy(decodedData, data[pos + 4:])
+		decodedData = make([]byte, len(data)-pos-4)
+		copy(decodedData, data[pos+4:])
 		t.rawTransReceived = true
 	}
 

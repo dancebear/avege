@@ -1,21 +1,155 @@
 package local
 
-type Stat struct {
-	Id                       string
-	Address                  string
-	ProtocolType             string
-	FailedCount              uint32
-	Latency                  int64
-	TotalUpload              uint64
-	TotalDownload            uint64
+import "sort"
+
+type totalStat struct {
+	TotalUpload   uint64
+	TotalDownload uint64
+}
+
+type highestStat struct {
 	HighestLastSecondBps     uint64
 	HighestLastMinuteBps     uint64
 	HighestLastTenMinutesBps uint64
 	HighestLastHourBps       uint64
-	LastSecondBps            uint64
-	LastMinuteBps            uint64
-	LastTenMinutesBps        uint64
-	LastHourBps              uint64
+}
+
+type lastStat struct {
+	LastSecondBps     uint64
+	LastMinuteBps     uint64
+	LastTenMinutesBps uint64
+	LastHourBps       uint64
+}
+
+type Stat struct {
+	totalStat
+	highestStat
+	lastStat
+	Id           string
+	Address      string
+	ProtocolType string
+	FailedCount  uint32
+	Latency      int64
+}
+
+type Sorter func(string, Stats)
+
+var (
+	statsSortMap = map[string]Sorter{
+		"failedcount":              orderByFailedCount,
+		"latency":                  orderByLatency,
+		"download":                 orderByTotalDownload,
+		"upload":                   orderByTotalUpload,
+		"highestlasthourbps":       orderByHighestLastHourBps,
+		"highestlasttenminutesbps": orderByHighestLastTenMinutesBps,
+		"highestlastminutebps":     orderByHighestLastMinuteBps,
+		"highestlastsecondbps":     orderByHighestLastSecondBps,
+		"lasthourbps":              orderByLastHourBps,
+		"lasttenminutesbps":        orderByLastTenMinutesBps,
+		"lastminutebps":            orderByLastMinuteBps,
+		"lastsecondbps":            orderByLastSecondBps,
+		"protocol":                 orderByProtocolType,
+		"address":                  orderByAddress,
+	}
+)
+
+func orderByFailedCount(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byFailedCount{stats}))
+	} else {
+		sort.Sort(byFailedCount{stats})
+	}
+}
+func orderByLatency(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byLatency{stats}))
+	} else {
+		sort.Sort(byLatency{stats})
+	}
+}
+func orderByTotalDownload(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byTotalDownload{stats}))
+	} else {
+		sort.Sort(byTotalDownload{stats})
+	}
+}
+func orderByTotalUpload(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byTotalUpload{stats}))
+	} else {
+		sort.Sort(byTotalUpload{stats})
+	}
+}
+func orderByHighestLastHourBps(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byHighestLastHourBps{stats}))
+	} else {
+		sort.Sort(byHighestLastHourBps{stats})
+	}
+}
+func orderByHighestLastTenMinutesBps(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byHighestLastTenMinutesBps{stats}))
+	} else {
+		sort.Sort(byHighestLastTenMinutesBps{stats})
+	}
+}
+func orderByHighestLastMinuteBps(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byHighestLastMinuteBps{stats}))
+	} else {
+		sort.Sort(byHighestLastMinuteBps{stats})
+	}
+}
+func orderByHighestLastSecondBps(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byHighestLastSecondBps{stats}))
+	} else {
+		sort.Sort(byHighestLastSecondBps{stats})
+	}
+}
+func orderByLastHourBps(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byLastHourBps{stats}))
+	} else {
+		sort.Sort(byLastHourBps{stats})
+	}
+}
+func orderByLastTenMinutesBps(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byLastTenMinutesBps{stats}))
+	} else {
+		sort.Sort(byLastTenMinutesBps{stats})
+	}
+}
+func orderByLastMinuteBps(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byLastMinuteBps{stats}))
+	} else {
+		sort.Sort(byLastMinuteBps{stats})
+	}
+}
+func orderByLastSecondBps(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byLastSecondBps{stats}))
+	} else {
+		sort.Sort(byLastSecondBps{stats})
+	}
+}
+func orderByProtocolType(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(byProtocolType{stats}))
+	} else {
+		sort.Sort(byProtocolType{stats})
+	}
+}
+func orderByAddress(order string, stats Stats) {
+	if order == "desc" {
+		sort.Sort(sort.Reverse(stats))
+	} else {
+		sort.Sort(stats)
+	}
 }
 
 type Stats []*Stat

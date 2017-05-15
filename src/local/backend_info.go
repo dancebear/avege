@@ -8,52 +8,63 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"common"
+	"config"
 	"github.com/RouterScript/ProxyClient"
 	"outbound/ss"
-	"outbound/ss/obfs"
-	"outbound/ss/protocol"
-	"outbound/ss/ssr"
 )
 
-var (
-	ERR_NOT_FILTERED = errors.New("server is not filtered out by firewall")
-)
+// CommonProxyInfo fields that auth for http/https/socks
+type CommonProxyInfo struct {
+	username string
+	password string
+}
 
+// HTTPSProxyInfo fields that https used only
+type HTTPSProxyInfo struct {
+	CommonProxyInfo
+	insecureSkipVerify bool
+	domain             string
+}
+
+// SSInfo fields that shadowsocks/shadowsocksr used only
+type SSInfo struct {
+	encryptMethod   string
+	encryptPassword string
+	tcpFastOpen     bool
+}
+
+// SSRInfo fields that shadowsocksr used only
+type SSRInfo struct {
+	SSInfo
+	obfs          string
+	obfsParam     string
+	obfsData      interface{}
+	protocol      string
+	protocolParam string
+	protocolData  interface{}
+}
+
+// BackendInfo all fields that a backend used
 type BackendInfo struct {
 	id                 string
 	address            string
 	protocolType       string
-	username           string      // auth for http/https/socks
-	password           string      // auth for http/https/socks
-	insecureSkipVerify bool        // https only
-	domain             string      // https only
-	obfs               string      // shadowsocksr only
-	obfsParam          string      // shadowsocksr only
-	obfsData           interface{} // shadowsocksr only
-	protocol           string      // shadowsocksr only
-	protocolParam      string      // shadowsocksr only
-	protocolData       interface{} // shadowsocksr only
-	cipher             *ss.Cipher  // shadowsocks/shadowsocksr only
-	tcpFastOpen        bool        // shadowsocks/shadowsocksr only
-	timeout            int
-	restrict           bool
+	timeout            time.Duration
 	local              bool
 	firewalled         bool
 	ipv6               bool
 	lastCheckTimePoint time.Time
 	ips                []net.IP
+	HTTPSProxyInfo
+	SSRInfo
 }
 
-func (bi *BackendInfo) testLatency(rawaddr []byte, addr string, wg *sync.WaitGroup) {
-	defer func() {
-		wg.Done()
-	}()
+func (bi *BackendInfo) testLatency(rawaddr []byte) {
 	startTime := time.Now()
-	remote, err := bi.connect(rawaddr, addr)
+	remote, err := bi.connect(rawaddr)
 	if err == nil {
 		if remote != nil {
 			defer remote.Close()
@@ -63,7 +74,7 @@ func (bi *BackendInfo) testLatency(rawaddr []byte, addr string, wg *sync.WaitGro
 	}
 	bi.lastCheckTimePoint = time.Now()
 	endTime := time.Now()
-	if stat, ok := Statistics.Get(bi); ok {
+	if stat, ok := statistics.Get(bi); ok {
 		if err != nil {
 			stat.IncreaseFailedCount()
 			if stat.GetFailedCount() > 10 {
@@ -76,34 +87,39 @@ func (bi *BackendInfo) testLatency(rawaddr []byte, addr string, wg *sync.WaitGro
 	}
 }
 
-func (bi *BackendInfo) pipe(local net.Conn, remote net.Conn, buffer *common.Buffer) (err error, inboundSideError bool) {
+func (bi *BackendInfo) pipe(local net.Conn, remote net.Conn, buffer *common.Buffer) (inboundSideError bool, err error) {
 	sig := make(chan bool)
 	result := make(chan error)
-	stat, ok := Statistics.Get(bi)
+	stat, ok := statistics.Get(bi)
 	if !ok || stat == nil {
-		return errors.New("invalid statistics"), false
+		return false, errors.New("invalid statistics")
 	}
 
 	go func() {
-		result <- PipeInboundToOutbound(local,
+		pp := pipeParam{
+			local,
 			remote,
-			time.Duration(config.Generals.InBoundTimeout)*time.Second,
-			time.Duration(bi.timeout)*time.Second,
+			config.Configurations.Generals.InboundTimeout,
+			bi.timeout,
 			stat,
 			sig,
-			&buffer)
+		}
+		result <- PipeInboundToOutbound(pp, &buffer)
 	}()
-	err = PipeOutboundToInbound(remote,
+	pp := pipeParam{
+		remote,
 		local,
-		time.Duration(bi.timeout)*time.Second,
-		time.Duration(config.Generals.InBoundTimeout)*time.Second,
+		bi.timeout,
+		config.Configurations.Generals.InboundTimeout,
 		stat,
-		sig)
-	if err == ERR_WRITE {
+		sig,
+	}
+	err = PipeOutboundToInbound(pp)
+	if err == ErrWrite {
 		inboundSideError = true
 	}
-	if err == ERR_READ || err == ERR_NOSIG || err == ERR_SIGFALSE {
-		Statistics.StatisticMap[bi].IncreaseFailedCount()
+	if err == ErrRead || err == ErrNoSignal || err == ErrSignalFalse {
+		statistics.StatisticMap[bi].IncreaseFailedCount()
 		common.Errorf("piping outbound to inbound error: %v, at %v\n", err, bi)
 		go func() {
 			// clear the channel
@@ -117,10 +133,10 @@ func (bi *BackendInfo) pipe(local net.Conn, remote net.Conn, buffer *common.Buff
 	}
 
 	err = <-result
-	if err == ERR_READ || err == ERR_WRITE || err == ERR_NOSIG || err == ERR_SIGFALSE {
-		Statistics.StatisticMap[bi].IncreaseFailedCount()
+	if err == ErrRead || err == ErrWrite || err == ErrNoSignal || err == ErrSignalFalse {
+		statistics.StatisticMap[bi].IncreaseFailedCount()
 		common.Errorf("piping inbound to outbound error: %v, at %v\n", err, bi)
-		if err == ERR_READ {
+		if err == ErrRead {
 			inboundSideError = true
 		}
 		return
@@ -130,334 +146,118 @@ func (bi *BackendInfo) pipe(local net.Conn, remote net.Conn, buffer *common.Buff
 		common.Error("piping inbound to outbound unknown error: ", neterr)
 	}
 
-	return nil, false
+	return false, nil
 }
 
-func (bi *BackendInfo) connectToProxy(u string, addr string) (remote net.Conn, err error) {
+func connectToProxy(u *url.URL, bi *BackendInfo) (remote net.Conn, err error) {
 	dialer := net.Dial
 	if bi.timeout != 0 {
-		dialer = proxyclient.DialWithTimeout(time.Duration(bi.timeout) * time.Second)
+		dialer = proxyclient.DialWithTimeout(bi.timeout)
 	}
-	p, err := proxyclient.NewProxyClientWithDial(u, dialer)
+	p, err := proxyclient.NewClientWithDial(u, dialer)
 
 	if err != nil {
-		common.Error("creating proxy client failed", u, err)
+		common.Error("creating proxy client failed", *u, err)
 		return
 	}
 
-	remote, err = p("tcp", addr)
+	remote, err = p("tcp", u.Host)
 	if err != nil {
-		common.Error("connecting to target failed.", u, addr, err)
+		common.Error("connecting to target failed.", *u, err)
 	}
 	return
 }
 
-func (bi *BackendInfo) connect(rawaddr []byte, addr string) (remote net.Conn, err error) {
-	switch bi.protocolType {
-	case "https", "socks5+tls":
-		u := url.URL{
-			Scheme:bi.protocolType,
-			User:  url.UserPassword(bi.username, bi.password),
-			Host:  bi.address,
-		}
-		v := u.Query()
-		if bi.insecureSkipVerify {
-			v.Set("tls-insecure-skip-verify", "true")
-		}
-		if len(bi.domain) > 0 {
-			v.Set("tls-domain", bi.domain)
-		}
-		if len(v) > 0 {
-			u.RawQuery = v.Encode()
-		}
-		return bi.connectToProxy(u.String(), addr)
-	case "http", "socks4", "socks4a", "socks5":
-		u := url.URL{
-			Scheme:bi.protocolType,
-			User:  url.UserPassword(bi.username, bi.password),
-			Host:  bi.address,
-		}
-		return bi.connectToProxy(u.String(), addr)
-	case "shadowsocks", "ss":
-		if bi.firewalled == true && time.Now().Sub(bi.lastCheckTimePoint) < 1*time.Hour {
-			err = ERR_NOT_FILTERED
-			common.Warningf("server %s is not filtered out by firewall.\n", bi.address)
-			return
-		}
+func tlsConnect(_ []byte, bi *BackendInfo) (remote net.Conn, err error) {
+	u := &url.URL{
+		Scheme: bi.protocolType,
+		User:   url.UserPassword(bi.username, bi.password),
+		Host:   bi.address,
+	}
+	v := u.Query()
+	v.Set("tls-insecure-skip-verify", strconv.FormatBool(bi.insecureSkipVerify))
+	v.Set("tls-domain", bi.domain)
+	u.RawQuery = v.Encode()
 
-		var ssconn *ss.SSTCPConn
-		priorityInterfaceAddress := config.Generals.PriorityInterfaceAddress
-		if !config.Generals.PriorityInterfaceEnabled {
-			priorityInterfaceAddress = ""
-		}
+	return connectToProxy(u, bi)
+}
 
-		if ssconn, err = ss.Dial(bi.address, bi.cipher.Copy(), priorityInterfaceAddress); err != nil {
-			return nil, err
-		}
+func plainConnect(_ []byte, bi *BackendInfo) (remote net.Conn, err error) {
+	u := &url.URL{
+		Scheme: bi.protocolType,
+		User:   url.UserPassword(bi.username, bi.password),
+		Host:   bi.address,
+	}
+	return connectToProxy(u, bi)
+}
 
-		if ssconn.Conn, err = ss.ProtectSocket(ssconn.Conn); err != nil {
-			return nil, err
-		}
+func ssConnect(rawaddr []byte, bi *BackendInfo) (remote net.Conn, err error) {
+	u := &url.URL{
+		Scheme: bi.protocolType,
+		Host:   bi.address,
+	}
 
-		// should initialize obfs/protocol now
-		rs := strings.Split(ssconn.RemoteAddr().String(), ":")
-		port, _ := strconv.Atoi(rs[1])
+	v := u.Query()
+	v.Set("priority-interface-enabled", strconv.FormatBool(config.Configurations.Generals.PriorityInterfaceEnabled))
+	v.Set("priority-interface-address", config.Configurations.Generals.PriorityInterfaceAddress)
+	v.Set("encrypt-method", bi.encryptMethod)
+	v.Set("encrypt-key", bi.encryptPassword)
+	v.Set("obfs", bi.obfs)
+	v.Set("obfs-param", bi.obfsParam)
+	v.Set("protocol", bi.protocol)
+	v.Set("protocol-param", bi.protocolParam)
+	u.RawQuery = v.Encode()
 
-		ssconn.IObfs = obfs.NewObfs(bi.obfs)
-		obfsServerInfo := &ssr.ServerInfoForObfs{
-			Host:       rs[0],
-			Port:       uint16(port),
-			TcpMss:     1460,
-			Param:      bi.obfsParam,
-		}
-		ssconn.IObfs.SetServerInfo(obfsServerInfo)
-		if bi.obfsData == nil {
-			bi.obfsData = ssconn.IObfs.GetData()
-		}
-		ssconn.IObfs.SetData(bi.obfsData)
+	if c, e := connectToProxy(u, bi); e == nil {
+		return setSSRData(rawaddr, bi, c)
+	}
+	return nil, errors.New("connecting to ss server failed")
+}
 
-		ssconn.IProtocol = protocol.NewProtocol(bi.protocol)
-		protocolServerInfo := &ssr.ServerInfoForObfs{
-			Host:       rs[0],
-			Port:       uint16(port),
-			TcpMss:     1460,
-			Param:      bi.protocolParam,
-		}
-		ssconn.IProtocol.SetServerInfo(protocolServerInfo)
-		if bi.protocolData == nil {
-			bi.protocolData = ssconn.IProtocol.GetData()
-		}
-		ssconn.IProtocol.SetData(bi.protocolData)
+func setSSRData(rawaddr []byte, bi *BackendInfo, c net.Conn) (remote net.Conn, err error) {
+	ssconn, ok := c.(*ss.SSTCPConn)
+	if !ok {
+		return nil, errors.New("not a *SSTCPConn")
+	}
+	if bi.obfsData == nil {
+		bi.obfsData = ssconn.IObfs.GetData()
+	}
+	ssconn.IObfs.SetData(bi.obfsData)
 
-		if _, err = ssconn.Write(rawaddr); err != nil {
-			ssconn.Close()
-			return nil, err
-		}
-		remote = ssconn
-	default:
+	if bi.protocolData == nil {
+		bi.protocolData = ssconn.IProtocol.GetData()
+	}
+	ssconn.IProtocol.SetData(bi.protocolData)
+
+	if _, err := ssconn.Write(rawaddr); err != nil {
+		ssconn.Close()
+		return nil, err
+	}
+	return ssconn, nil
+}
+
+type connector func([]byte, *BackendInfo) (net.Conn, error)
+
+var (
+	connectorMap = map[string]connector{
+		"https":        tlsConnect,
+		"socks5+tls":   tlsConnect,
+		"http":         plainConnect,
+		"socks4":       plainConnect,
+		"socks4a":      plainConnect,
+		"socks5":       plainConnect,
+		"ss":           ssConnect,
+		"ssr":          ssConnect,
+		"shadowsocks":  ssConnect,
+		"shadowsocksr": ssConnect,
+	}
+)
+
+func (bi *BackendInfo) connect(rawaddr []byte) (remote net.Conn, err error) {
+	ctr, ok := connectorMap[strings.ToLower(bi.protocolType)]
+	if !ok {
 		return nil, fmt.Errorf("Unknown backend protocol type: %s", bi.protocolType)
 	}
-	return
-}
 
-type BackendsInformation []*BackendInfo
-
-func (slice BackendsInformation) Len() int {
-	return len(slice)
-}
-
-func (slice BackendsInformation) Swap(i, j int) {
-	slice[i], slice[j] = slice[j], slice[i]
-}
-
-type ByLastSecondBps struct{ BackendsInformation }
-
-func (slice ByLastSecondBps) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetLastSecondBps() > Statistics.StatisticMap[slice.BackendsInformation[j]].GetLastSecondBps()
-}
-
-type ByLastMinuteBps struct{ BackendsInformation }
-
-func (slice ByLastMinuteBps) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetLastMinuteBps() > Statistics.StatisticMap[slice.BackendsInformation[j]].GetLastMinuteBps()
-}
-
-type ByLastTenMinutesBps struct{ BackendsInformation }
-
-func (slice ByLastTenMinutesBps) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetLastTenMinutesBps() > Statistics.StatisticMap[slice.BackendsInformation[j]].GetLastTenMinutesBps()
-}
-
-type ByLastHourBps struct{ BackendsInformation }
-
-func (slice ByLastHourBps) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetLastHourBps() > Statistics.StatisticMap[slice.BackendsInformation[j]].GetLastHourBps()
-}
-
-type ByHighestLastSecondBps struct{ BackendsInformation }
-
-func (slice ByHighestLastSecondBps) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetHighestLastSecondBps() > Statistics.StatisticMap[slice.BackendsInformation[j]].GetHighestLastSecondBps()
-}
-
-type ByHighestLastMinuteBps struct{ BackendsInformation }
-
-func (slice ByHighestLastMinuteBps) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetHighestLastMinuteBps() > Statistics.StatisticMap[slice.BackendsInformation[j]].GetHighestLastMinuteBps()
-}
-
-type ByHighestLastTenMinutesBps struct{ BackendsInformation }
-
-func (slice ByHighestLastTenMinutesBps) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetHighestLastTenMinutesBps() > Statistics.StatisticMap[slice.BackendsInformation[j]].GetHighestLastTenMinutesBps()
-}
-
-type ByHighestLastHourBps struct{ BackendsInformation }
-
-func (slice ByHighestLastHourBps) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetHighestLastHourBps() > Statistics.StatisticMap[slice.BackendsInformation[j]].GetHighestLastHourBps()
-}
-
-type ByLatency struct{ BackendsInformation }
-
-func (slice ByLatency) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	if Statistics.StatisticMap[slice.BackendsInformation[i]].GetLatency() == 0 {
-		return false
-	}
-	if Statistics.StatisticMap[slice.BackendsInformation[j]].GetLatency() == 0 {
-		return true
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetLatency() < Statistics.StatisticMap[slice.BackendsInformation[j]].GetLatency()
-}
-
-type ByFailedCount struct{ BackendsInformation }
-
-func (slice ByFailedCount) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetFailedCount() < Statistics.StatisticMap[slice.BackendsInformation[j]].GetFailedCount()
-}
-
-type ByTotalUpload struct{ BackendsInformation }
-
-func (slice ByTotalUpload) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetTotalUploaded() > Statistics.StatisticMap[slice.BackendsInformation[j]].GetTotalUploaded()
-}
-
-type ByTotalDownload struct{ BackendsInformation }
-
-func (slice ByTotalDownload) Less(i, j int) bool {
-	Statistics.RLock()
-	defer Statistics.RUnlock()
-	if bi, ok := Statistics.StatisticMap[slice.BackendsInformation[i]]; !ok || bi == nil {
-		return false
-	}
-	if sj, ok := Statistics.StatisticMap[slice.BackendsInformation[j]]; !ok || sj == nil {
-		return false
-	}
-	return Statistics.StatisticMap[slice.BackendsInformation[i]].GetTotalDownload() < Statistics.StatisticMap[slice.BackendsInformation[j]].GetTotalDownload()
-}
-
-type BackendsInformationWrapper struct {
-	sync.RWMutex
-	BackendsInformation
-}
-
-func NewBackendsInformationWrapper() *BackendsInformationWrapper {
-	biw := &BackendsInformationWrapper{}
-	biw.BackendsInformation = make(BackendsInformation, 0)
-	return biw
-}
-
-func (biw *BackendsInformationWrapper) Append(bi *BackendInfo) {
-	biw.Lock()
-	defer biw.Unlock()
-	biw.BackendsInformation = append(biw.BackendsInformation, bi)
-}
-
-func (biw *BackendsInformationWrapper) Remove(i int) {
-	biw.Lock()
-	defer biw.Unlock()
-	biw.BackendsInformation = append(biw.BackendsInformation[:i], biw.BackendsInformation[i + 1:]...)
-}
-
-func (biw *BackendsInformationWrapper) Get(i int) *BackendInfo {
-	biw.RLock()
-	defer biw.RUnlock()
-	if i >= len(biw.BackendsInformation) {
-		return nil
-	}
-	return biw.BackendsInformation[i]
-}
-
-func (biw *BackendsInformationWrapper) Len() int {
-	biw.RLock()
-	defer biw.RUnlock()
-	return len(biw.BackendsInformation)
+	return ctr(rawaddr, bi)
 }

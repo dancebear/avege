@@ -12,8 +12,8 @@ import (
 
 	"common"
 	"common/ds"
-	chacha20IETF "github.com/aead/chacha20"
-	"github.com/codahale/chacha20"
+
+	"github.com/Yawning/chacha20"
 	"github.com/dgryski/go-camellia"
 	"github.com/dgryski/go-idea"
 	"github.com/dgryski/go-rc2"
@@ -96,24 +96,11 @@ func newRC4MD5Stream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
 }
 
 func newChaCha20Stream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
-	return chacha20.New(key, iv)
+	return chacha20.NewCipher(key, iv)
 }
 
 func newChacha20IETFStream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
-	if len(key) != 32 {
-		return nil, errors.New("invlaid key size")
-	}
-	if len(iv) != chacha20IETF.NonceSize {
-		return nil, errors.New("invlaid iv size")
-	}
-	var (
-		Key   [32]byte
-		nonce [chacha20IETF.NonceSize]byte
-	)
-	copy(Key[:], key)
-	copy(nonce[:], iv)
-
-	return chacha20IETF.NewCipher(&nonce, &Key), nil
+	return chacha20.NewCipher(key, iv)
 }
 
 type salsaStreamCipher struct {
@@ -138,7 +125,7 @@ func (c *salsaStreamCipher) XORKeyStream(dst, src []byte) {
 
 	var subNonce [16]byte
 	copy(subNonce[:], c.nonce[:])
-	binary.LittleEndian.PutUint64(subNonce[len(c.nonce):], uint64(c.counter / 64))
+	binary.LittleEndian.PutUint64(subNonce[len(c.nonce):], uint64(c.counter/64))
 
 	// It's difficult to avoid data copy here. src or dst maybe slice from
 	// Conn.Read/Write, which can't have padding.
@@ -183,7 +170,7 @@ type cipherInfo struct {
 	newStream func(key, iv []byte, doe DecOrEnc) (cipher.Stream, error)
 }
 
-var cipherMethod = map[string]*cipherInfo{
+var streamCipherMethod = map[string]*cipherInfo{
 	"aes-128-cfb":      {16, 16, newAESCFBStream},
 	"aes-192-cfb":      {24, 16, newAESCFBStream},
 	"aes-256-cfb":      {32, 16, newAESCFBStream},
@@ -197,6 +184,7 @@ var cipherMethod = map[string]*cipherInfo{
 	"bf-cfb":           {16, 8, newBlowFishStream},
 	"cast5-cfb":        {16, 8, newCast5Stream},
 	"rc4-md5":          {16, 16, newRC4MD5Stream},
+	"rc4-md5-6":        {16, 6, newRC4MD5Stream},
 	"chacha20":         {32, 8, newChaCha20Stream},
 	"chacha20-ietf":    {32, 12, newChacha20IETFStream},
 	"salsa20":          {32, 8, newSalsa20Stream},
@@ -210,16 +198,16 @@ var cipherMethod = map[string]*cipherInfo{
 
 func CheckCipherMethod(method string) error {
 	if method == "" {
-		method = "table"
+		method = "rc4-md5"
 	}
-	_, ok := cipherMethod[method]
+	_, ok := streamCipherMethod[method]
 	if !ok {
 		return errors.New("Unsupported encryption method: " + method)
 	}
 	return nil
 }
 
-type Cipher struct {
+type StreamCipher struct {
 	enc  cipher.Stream
 	dec  cipher.Stream
 	key  []byte
@@ -227,24 +215,24 @@ type Cipher struct {
 	iv   []byte
 }
 
-// NewCipher creates a cipher that can be used in Dial() etc.
+// NewStreamCipher creates a cipher that can be used in Dial() etc.
 // Use cipher.Copy() to create a new cipher with the same method and password
 // to avoid the cost of repeated cipher initialization.
-func NewCipher(method, password string) (c *Cipher, err error) {
+func NewStreamCipher(method, password string) (c *StreamCipher, err error) {
 	if password == "" {
 		return nil, errEmptyPassword
 	}
 	if method == "" {
 		method = "rc4-md5"
 	}
-	mi, ok := cipherMethod[method]
+	mi, ok := streamCipherMethod[method]
 	if !ok {
 		return nil, errors.New("Unsupported encryption method: " + method)
 	}
 
 	key := common.EVPBytesToKey(password, mi.keyLen)
 
-	c = &Cipher{key: key, info: mi}
+	c = &StreamCipher{key: key, info: mi}
 
 	if err != nil {
 		return nil, err
@@ -253,7 +241,7 @@ func NewCipher(method, password string) (c *Cipher, err error) {
 }
 
 // Initializes the block cipher with CFB mode, returns IV.
-func (c *Cipher) initEncrypt() (iv []byte, err error) {
+func (c *StreamCipher) initEncrypt() (iv []byte, err error) {
 	if c.iv == nil {
 		iv = make([]byte, c.info.ivLen)
 		rand.Read(iv)
@@ -265,21 +253,21 @@ func (c *Cipher) initEncrypt() (iv []byte, err error) {
 	return
 }
 
-func (c *Cipher) initDecrypt(iv []byte) (err error) {
+func (c *StreamCipher) initDecrypt(iv []byte) (err error) {
 	c.dec, err = c.info.newStream(c.key, iv, Decrypt)
 	return
 }
 
-func (c *Cipher) encrypt(dst, src []byte) {
+func (c *StreamCipher) encrypt(dst, src []byte) {
 	c.enc.XORKeyStream(dst, src)
 }
 
-func (c *Cipher) decrypt(dst, src []byte) {
+func (c *StreamCipher) decrypt(dst, src []byte) {
 	c.dec.XORKeyStream(dst, src)
 }
 
 // Copy creates a new cipher at it's initial state.
-func (c *Cipher) Copy() *Cipher {
+func (c *StreamCipher) Copy() *StreamCipher {
 	// This optimization maybe not necessary. But without this function, we
 	// need to maintain a table cache for newTableCipher and use lock to
 	// protect concurrent access to that cache.
@@ -299,10 +287,10 @@ func (c *Cipher) Copy() *Cipher {
 	return &nc
 }
 
-func (c *Cipher) Key() (key []byte, keyLen int) {
+func (c *StreamCipher) Key() (key []byte, keyLen int) {
 	return c.key, c.info.keyLen
 }
 
-func (c *Cipher) IV() ([]byte, int) {
+func (c *StreamCipher) IV() ([]byte, int) {
 	return c.iv, c.info.ivLen
 }

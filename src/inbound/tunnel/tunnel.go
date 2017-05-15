@@ -9,26 +9,25 @@ import (
 	"inbound"
 )
 
-func GetInboundHandler(inbound *inbound.InBound) inbound.InBoundHander {
+func parseAddr(inbound *inbound.Inbound) (rawaddr []byte, addr string) {
 	host, p, err := net.SplitHostPort(inbound.Parameter)
 	if err != nil {
 		common.Error("incorrect inbound parameter format", inbound.Parameter, err)
-		return nil
+		return
 	}
 	port, err := strconv.Atoi(p)
 	if err != nil {
 		common.Error("can't convert port string", p, err)
-		return nil
+		return
 	}
 	ip := net.ParseIP(host)
-	var rawaddr []byte
 	if ip == nil {
 		// variant length domain name
-		rawaddr = make([]byte, 1 + 1 + len(host) + 2)
+		rawaddr = make([]byte, 1+1+len(host)+2)
 		rawaddr[0] = 3
 		rawaddr[1] = byte(len(host))
-		copy(rawaddr[2:2 + len(host)], []byte(host))
-		binary.BigEndian.PutUint16(rawaddr[2 + len(host):], uint16(port))
+		copy(rawaddr[2:2+len(host)], []byte(host))
+		binary.BigEndian.PutUint16(rawaddr[2+len(host):], uint16(port))
 	} else if ip.To4() != nil {
 		// IPv4
 		rawaddr = make([]byte, 7)
@@ -42,14 +41,27 @@ func GetInboundHandler(inbound *inbound.InBound) inbound.InBoundHander {
 		// IPv6
 		rawaddr = make([]byte, 19)
 		rawaddr[0] = 4
-		copy(rawaddr[1:1 + 16], ip.To16())
+		copy(rawaddr[1:1+16], ip.To16())
 		binary.BigEndian.PutUint16(rawaddr[17:], uint16(port))
 	} else {
 
 	}
-	addr := inbound.Parameter
-	return func(conn *net.TCPConn, outboundHander common.OutboundHandler) {
+	addr = inbound.Parameter
+	return
+}
+
+func GetUDPInboundHandler(inbound *inbound.Inbound) inbound.UDPInboundHandler {
+	rawaddr, addr := parseAddr(inbound)
+	return func(c net.PacketConn, outboundHandler common.UDPOutboundHandler) error {
+		common.Debug("tunnel connect from", c.LocalAddr().String())
+		return outboundHandler(c, rawaddr, addr)
+	}
+}
+
+func GetTCPInboundHandler(inbound *inbound.Inbound) inbound.TCPInboundHandler {
+	rawaddr, addr := parseAddr(inbound)
+	return func(conn *net.TCPConn, outboundHandler common.TCPOutboundHandler) error {
 		common.Debugf("tunnel connect from %s\n", conn.RemoteAddr().String())
-		outboundHander(conn, rawaddr, addr)
+		return outboundHandler(conn, rawaddr, addr)
 	}
 }

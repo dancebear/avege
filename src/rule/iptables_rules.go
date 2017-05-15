@@ -1,6 +1,6 @@
 // +build linux
 
-package local
+package rule
 
 import (
 	"bufio"
@@ -18,6 +18,7 @@ import (
 
 	"common"
 	"common/fs"
+	"config"
 )
 
 var (
@@ -59,7 +60,7 @@ func monitorFileChange(fileName string) {
 	go fs.MonitorFileChanegs(fileName, configFileChanged)
 }
 
-func updateRedirFirewallRules() {
+func UpdateRedirFirewallRules() {
 	if oneUpdateIptablesRules == nil {
 		oneUpdateIptablesRules = &sync.Once{}
 	}
@@ -69,7 +70,7 @@ func updateRedirFirewallRules() {
 func getSSServerDomainList() (res []string) {
 	retry := 0
 doRequest:
-	req, err := http.NewRequest("GET", config.Generals.ConsoleHost+"/admin/servers", nil)
+	req, err := http.NewRequest("GET", config.Configurations.Generals.ConsoleHost+"/admin/servers", nil)
 	if err != nil {
 		common.Error("Could not parse get ss server list request:", err)
 		return
@@ -155,24 +156,29 @@ func resolveIPFromDomainName(host string) (res []string) {
 	return
 }
 
-func doUpdateRules() {
-	var records []string
-	encountered := make(map[string]bool)
+func addAbroadDNSServerIPs(encountered map[string]bool) (records []string) {
 	// abroad DNS servers IPs
 	record := "-A SS -d %s/32 -j RETURN"
 	records = append(records, "# skip DNS server out of China")
-	for _, v := range config.DNSProxy.Abroad {
-		if v.Protocol == "tcp" {
-			val := fmt.Sprintf(record, v.Address[:strings.Index(v.Address, ":")])
-			if _, ok := encountered[val]; !ok {
-				// don't insert duplicated items
-				encountered[val] = true
-				records = append(records, val)
-			}
+	for _, v := range config.Configurations.DNSProxy.Abroad {
+		if v.Protocol != "tcp" {
+			// only TCP is NATed
+			continue
 		}
+		val := fmt.Sprintf(record, v.Address[:strings.Index(v.Address, ":")])
+		if _, ok := encountered[val]; ok {
+			// don't insert duplicated items
+			continue
+		}
+		encountered[val] = true
+		records = append(records, val)
 	}
+	return
+}
 
+func addProxyServerIPs(encountered map[string]bool) (records []string) {
 	// ss servers ip
+	record := "-A SS -d %s/32 -j RETURN"
 	var ss []string
 	for len(ss) == 0 {
 		ss = getSSServerDomainList()
@@ -195,7 +201,10 @@ func doUpdateRules() {
 			}
 		}
 	}
+	return
+}
 
+func addChinaIPs(encountered map[string]bool) (records []string) {
 	// china IPs
 	apnicFile, err := fs.GetConfigPath("apnic.txt")
 	if err != nil {
@@ -210,7 +219,7 @@ func doUpdateRules() {
 		scanner.Split(bufio.ScanLines)
 
 		records = append(records, "# skip ip in China")
-		record = "-A SS -d %s/%d -j RETURN"
+		record := "-A SS -d %s/%d -j RETURN"
 		for scanner.Scan() {
 			rec := scanner.Text()
 			s := strings.Split(rec, "|")
@@ -225,28 +234,36 @@ func doUpdateRules() {
 			}
 		}
 	}
+	return
+}
 
+func addCurrentRunningServerIPs(encountered map[string]bool) (res []string) {
 	// current running server addresses
-	record = "-A SS -d %s/32 -j RETURN"
-	var res []string
-	Statistics.RLock()
-	for si := range Statistics.StatisticMap {
-		host, _, _ := net.SplitHostPort(si.address)
-		if ips, err := net.LookupIP(host); err == nil {
-			for _, ip := range ips {
-				if ip.To4() != nil {
-					val := fmt.Sprintf(record, ip.String())
-					if _, ok := encountered[val]; !ok {
-						// don't insert duplicated items
-						encountered[val] = true
-						res = append(res, val)
-					}
-				}
+	record := "-A SS -d %s/32 -j RETURN"
+	for _, outbound := range config.Configurations.OutboundsConfig {
+		host, _, _ := net.SplitHostPort(outbound.Address)
+		ips, err := net.LookupIP(host)
+		if err != nil {
+			continue
+		}
+		for _, ip := range ips {
+			if ip.To4() == nil {
+				// invalid IPv4 address
+				continue
 			}
+			val := fmt.Sprintf(record, ip.String())
+			if _, ok := encountered[val]; ok {
+				// don't insert duplicated items
+				continue
+			}
+			encountered[val] = true
+			res = append(res, val)
 		}
 	}
-	Statistics.RUnlock()
+	return
+}
 
+func saveToRuleFile(res []string, records []string) {
 	if file, err := os.OpenFile(ruleFile, os.O_TRUNC|os.O_WRONLY|os.O_CREATE, 0644); err != nil {
 		common.Error("open rule file failed", err)
 	} else {
@@ -254,6 +271,14 @@ func doUpdateRules() {
 		file.Close()
 		common.Debug("rule file has been updated")
 	}
+}
 
+func doUpdateRules() {
+	encountered := make(map[string]bool)
+	records := addAbroadDNSServerIPs(encountered)
+	records = append(records, addProxyServerIPs(encountered)...)
+	records = append(records, addChinaIPs(encountered)...)
+	res := addCurrentRunningServerIPs(encountered)
+	saveToRuleFile(res, records)
 	oneUpdateIptablesRules = nil
 }

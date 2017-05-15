@@ -6,6 +6,8 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"reflect"
+	"strconv"
 	"time"
 
 	"common"
@@ -13,12 +15,16 @@ import (
 	"common/domain"
 	"common/fs"
 	iputil "common/ip"
+	"config"
+	"dnsproxy"
 	"github.com/DeanThompson/ginpprof"
 	"github.com/gin-gonic/gin"
 	"inbound"
 	"inbound/redir"
 	"inbound/socks"
 	"inbound/tunnel"
+	"outbound/ss"
+	"rule"
 )
 
 const (
@@ -26,65 +32,89 @@ const (
 )
 
 var (
-	quit = make(chan bool)
+	quit             = make(chan bool)
+	udpBroadcastConn *net.UDPConn
 )
 
-func run() {
-	wait := false
-	serveInbound := func(ib *inbound.InBound, ibHandler inbound.InBoundHander) {
-		ln, err := net.ListenTCP("tcp", &net.TCPAddr{
-			IP:   net.ParseIP(ib.Address),
-			Port: ib.Port,
-			Zone: "",
-		})
+func serveTCPInbound(ib *inbound.Inbound, ibHandler inbound.TCPInboundHandler) {
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{
+		IP:   net.ParseIP(ib.Address),
+		Port: ib.Port,
+		Zone: "",
+	})
+	if err != nil {
+		common.Panic("Failed listening on TCP port", ib.Address, err)
+		return
+	}
+
+	for {
+		conn, err := ln.AcceptTCP()
 		if err != nil {
-			common.Panic("Failed listening", err)
-			return
+			common.Error("accept err: ", err)
+			continue
 		}
-
-		for {
-			conn, err := ln.AcceptTCP()
-			if err != nil {
-				common.Error("accept err: ", err)
-				continue
-			}
-			go ibHandler(conn, handleOutbound)
-		}
+		go ibHandler(conn, handleTCPOutbound)
 	}
+}
 
-	runInbound := func(ib *inbound.InBound) {
-		switch ib.Type {
-		case "socks5", "socks":
-			go serveInbound(ib, socks.GetInboundHandler(ib))
-		case "redir":
-			if leftQuote <= 0 {
-				common.Fatal("no quote now, please charge in time")
-				break
-			}
-			go serveInbound(ib, redir.GetInboundHandler(ib))
-		case "tunnel":
-			go serveInbound(ib, tunnel.GetInboundHandler(ib))
-		}
+func serveUDPInbound(ib *inbound.Inbound, ibHandler inbound.UDPInboundHandler) {
+	c, err := net.ListenPacket("udp", net.JoinHostPort(ib.Address, strconv.Itoa(ib.Port)))
+	if err != nil {
+		common.Panic("Failed listening on UDP port", ib.Address, err)
+		return
 	}
+	defer c.Close()
 
-	if config.InBoundConfig != nil {
-		wait = true
-		inbound.InBoundModeEnable(config.InBoundConfig.Type)
-		go runInbound(config.InBoundConfig)
+	for err == nil {
+		err = ibHandler(c, handleUDPOutbound)
 	}
-	for _, i := range config.InBoundsConfig {
-		wait = true
-		inbound.InBoundModeEnable(i.Type)
+}
+
+func runInbound(ib *inbound.Inbound) {
+	if config.LeftQuote <= 0 {
+		common.Fatal("no quote now, please charge in time")
+	}
+	switch ib.Type {
+	case "socks5", "socks":
+		go serveTCPInbound(ib, socks.GetTCPInboundHandler(ib))
+		//go serveUDPInbound(ib, socks.GetUDPInboundHandler(ib))
+	case "redir":
+		go serveTCPInbound(ib, redir.GetTCPInboundHandler(ib))
+		//go serveUDPInbound(ib, redir.GetUDPInboundHandler(ib))
+	case "tunnel":
+		go serveTCPInbound(ib, tunnel.GetTCPInboundHandler(ib))
+		go serveUDPInbound(ib, tunnel.GetUDPInboundHandler(ib))
+	}
+}
+
+func run() {
+	if config.Configurations.InboundConfig != nil {
+		inbound.ModeEnable(config.Configurations.InboundConfig.Type)
+		go runInbound(config.Configurations.InboundConfig)
+	}
+	for _, i := range config.Configurations.InboundsConfig {
+		inbound.ModeEnable(i.Type)
 		go runInbound(i)
 	}
 
-	if config.DNSProxy.Enabled {
-		wait = true
+	if config.Configurations.DNSProxy.Enabled {
+		dnsproxy.Start()
+	}
+	statistics.LoadFromCache()
+	if config.Configurations.Generals.ConsoleReportEnabled {
+		go consoleWS()
+		go getQuote()
+	}
+	if inbound.IsModeEnabled("redir") {
+		go rule.UpdateRedirFirewallRules()
 	}
 
-	if wait {
-		select {}
+	if inbound.Has() {
+		go statistics.UpdateLatency()
+		go statistics.UpdateServerIP()
 	}
+
+	timers()
 }
 
 func dialUDP() (conn *net.UDPConn, err error) {
@@ -102,78 +132,101 @@ func dialUDP() (conn *net.UDPConn, err error) {
 	return
 }
 
+func onSecondTicker() {
+	if inbound.Has() {
+		go statistics.UpdateBps()
+	}
+	if config.Configurations.Generals.BroadcastEnabled {
+		if udpBroadcastConn == nil {
+			common.Warning("broadcast UDP conn is nil")
+			udpBroadcastConn, _ = dialUDP()
+			if udpBroadcastConn == nil {
+				common.Warning("recreating UDP conn failed")
+			}
+		}
+		if _, err := udpBroadcastConn.Write([]byte(config.Configurations.Generals.Token)); err != nil {
+			common.Error("failed to broadcast", err)
+			udpBroadcastConn.Close()
+			udpBroadcastConn, _ = dialUDP()
+		}
+	}
+}
+
+func onMinuteTicker() {
+	if inbound.Has() {
+		go statistics.UpdateLatency()
+	}
+	if config.Configurations.Generals.ConsoleReportEnabled {
+		go uploadStatistic()
+	}
+}
+
+func onHourTicker() {
+	if inbound.Has() {
+		go statistics.UpdateServerIP()
+	}
+}
+
+func onDayTicker() {
+	if inbound.IsModeEnabled("redir") {
+		go rule.UpdateRedirFirewallRules()
+	}
+}
+
+func onWeekTicker() {
+	go iputil.LoadChinaIPList(true)
+	go domain.UpdateDomainNameInChina()
+	go domain.UpdateDomainNameToBlock()
+	go domain.UpdateGFWList()
+}
+
 func timers() {
-	var conn *net.UDPConn
-	var err error
-	if config.Generals.BroadcastEnabled {
-		for ; ; time.Sleep(3 * time.Second) {
-			if conn, err = dialUDP(); err == nil {
-				break
-			}
-		}
+	type onTicker func()
+	onTickers := []struct {
+		*time.Ticker
+		onTicker
+	}{
+		{time.NewTicker(1 * time.Second), onSecondTicker},
+		{time.NewTicker(1 * time.Minute), onMinuteTicker},
+		{time.NewTicker(1 * time.Hour), onHourTicker},
+		{time.NewTicker(24 * time.Hour), onDayTicker},
+		{time.NewTicker(7 * 24 * time.Hour), onWeekTicker},
 	}
 
-	secondTicker := time.NewTicker(1 * time.Second)
-	minuteTicker := time.NewTicker(1 * time.Minute)
-	hourTicker := time.NewTicker(1 * time.Hour)
-	dayTicker := time.NewTicker(24 * time.Hour)
-	weekTicker := time.NewTicker(7 * 24 * time.Hour)
-	for {
-		select {
-		case <-secondTicker.C:
-			if inbound.HasInBound() {
-				go Statistics.UpdateBps()
-			}
-			if config.Generals.BroadcastEnabled {
-				if conn == nil {
-					common.Warning("broadcast UDP conn is nil")
-					conn, _ = dialUDP()
-					if conn == nil {
-						common.Warning("recreating UDP conn failed")
-						break
-					}
-				}
-				if _, err = conn.Write([]byte(config.Generals.Token)); err != nil {
-					common.Error("failed to broadcast", err)
-					conn.Close()
-					conn, _ = dialUDP()
-				}
-			}
-		case <-minuteTicker.C:
-			if inbound.HasInBound() {
-				go Statistics.UpdateLatency()
-			}
-			if config.Generals.ConsoleReportEnabled {
-				go uploadStatistic()
-			}
-		case <-hourTicker.C:
-			if inbound.HasInBound() {
-				go Statistics.UpdateServerIP()
-			}
-		case <-dayTicker.C:
-			if inbound.IsInBoundModeEnabled("redir") {
-				go updateRedirFirewallRules()
-			}
-		case <-weekTicker.C:
-			go iputil.LoadChinaIPList(true)
-			go domain.UpdateDomainNameInChina()
-			go domain.UpdateDomainNameToBlock()
-			go domain.UpdateGFWList()
-		case <-quit:
-			goto doQuit
-		}
+	cases := make([]reflect.SelectCase, len(onTickers)+1)
+	for i, v := range onTickers {
+		cases[i].Dir = reflect.SelectRecv
+		cases[i].Chan = reflect.ValueOf(v.Ticker.C)
+	}
+	cases[len(onTickers)].Dir = reflect.SelectRecv
+	cases[len(onTickers)].Chan = reflect.ValueOf(quit)
+
+	for chosen, _, _ := reflect.Select(cases); chosen < len(onTickers); chosen, _, _ = reflect.Select(cases) {
+		onTickers[chosen].onTicker()
 	}
 
-doQuit:
-	secondTicker.Stop()
-	minuteTicker.Stop()
-	hourTicker.Stop()
-	dayTicker.Stop()
-	weekTicker.Stop()
-
-	if config.Generals.BroadcastEnabled {
-		conn.Close()
+	for _, v := range onTickers {
+		v.Ticker.Stop()
 	}
+}
+
+func parseMultiServersConfig() error {
+
+	updateSSConfigurations()
+
+	updateConsoleConfigurations()
+
+	removeDeprecatedServers()
+
+	updateNewServers()
+
+	common.Debugf("servers in config: %V\n", backends)
+
+	return nil
+}
+
+func updateSSConfigurations() {
+	ss.ProtectSocketPathPrefix = config.Configurations.Generals.ProtectSocketPathPrefix
 }
 
 // Main the entry of this program
@@ -182,7 +235,7 @@ func Main() {
 	var printVer bool
 
 	flag.BoolVar(&printVer, "version", false, "print (v)ersion")
-	flag.StringVar(&configFile, "c", "config.json", "(s)pecify config file")
+	flag.StringVar(&configFile, "c", "config.Configurations.json", "(s)pecify config file")
 
 	flag.Parse()
 
@@ -198,19 +251,21 @@ func Main() {
 		common.Panic("config file not found")
 	}
 
-	if err = parseMultiServersConfigFile(configFile); err != nil {
+	if err = config.ParseMultiServersConfigFile(configFile); err != nil {
 		common.Panic("parsing multi servers config file failed: ", err)
 	}
+	parseMultiServersConfig()
 
 	configFileChanged := make(chan bool)
 	go func() {
 		for {
 			select {
 			case <-configFileChanged:
-				if err = parseMultiServersConfigFile(configFile); err != nil {
+				if err = config.ParseMultiServersConfigFile(configFile); err != nil {
 					common.Error("reloading multi servers config file failed: ", err)
 				} else {
 					common.Debug("reload", configFile)
+					parseMultiServersConfig()
 				}
 			}
 		}
@@ -218,10 +273,10 @@ func Main() {
 	go fs.MonitorFileChanegs(configFile, configFileChanged)
 	// end reading config file
 
-	common.DebugLevel = common.DebugLog(config.Generals.LogLevel)
+	common.DebugLevel = common.DebugLog(config.Configurations.Generals.LogLevel)
 
-	if config.Generals.APIEnabled {
-		if config.Generals.GenRelease {
+	if config.Configurations.Generals.APIEnabled {
+		if config.Configurations.Generals.GenRelease {
 			gin.SetMode(gin.ReleaseMode)
 		}
 		r := gin.Default()
@@ -260,36 +315,19 @@ func Main() {
 		r.StaticFS("/static", http.Dir("./resources/static"))
 		r.StaticFile("/favicon.ico", "./resources/favicon.ico")
 
-		if config.Generals.PProfEnabled {
+		if config.Configurations.Generals.PProfEnabled {
 			ginpprof.Wrapper(r)
 		}
-		go r.Run(config.Generals.API) // listen and serve
+		go r.Run(config.Configurations.Generals.API) // listen and serve
 	}
 
-	ApplyGeneralConfig()
+	config.ApplyGeneralConfig()
 
-	switch config.Generals.CacheService {
+	switch config.Configurations.Generals.CacheService {
 	case "redis":
 		cache.DefaultRedisKey = "avegeClient"
 	}
-	cache.Init(config.Generals.CacheService)
-
-	if config.DNSProxy.Enabled {
-		startDNSProxy()
-	}
-	Statistics.LoadFromCache()
-	if config.Generals.ConsoleReportEnabled {
-		go consoleWS()
-		go getQuote()
-	}
-	if inbound.IsInBoundModeEnabled("redir") {
-		go updateRedirFirewallRules()
-	}
-	if inbound.HasInBound() {
-		go Statistics.UpdateLatency()
-		go Statistics.UpdateServerIP()
-	}
-	go timers()
+	cache.Init(config.Configurations.Generals.CacheService)
 
 	run()
 }

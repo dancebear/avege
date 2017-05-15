@@ -10,6 +10,7 @@ import (
 )
 
 var (
+	// ProtectSocketPathPrefix prefix of file path that used for Unix socket communication
 	ProtectSocketPathPrefix string
 )
 
@@ -21,8 +22,9 @@ func ProtectSocket(clientConn net.Conn) (newTCPConn *net.TCPConn, err error) {
 	}
 	clientConnFile, err := tcpConn.File()
 	if err != nil {
+		// seemly Windows fall through there
 		common.Warning("can't get the File Handle of a *net.TCPConn")
-		return tcpConn, err
+		return tcpConn, nil
 	} else {
 		tcpConn.Close()
 	}

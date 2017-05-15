@@ -2,13 +2,19 @@
 
 Socks5/Transparent Proxy Client
 
-[![Build Status](https://secure.travis-ci.org/missdeer/avege.png)](https://travis-ci.org/missdeer/avege) [![GitHub release](https://img.shields.io/github/release/missdeer/avege.svg?maxAge=2592000)](https://github.com/missdeer/avege/releases) [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/missdeer/avege/master/LICENSE) [![Github Releases Downloads Total](https://img.shields.io/github/downloads/missdeer/avege/total.svg)](https://github.com/missdeer/avege/releases)
+[![Build Status](https://travis-ci.org/avege/avege.svg?branch=master)](https://travis-ci.org/avege/avege)
+[![Join the chat at https://t.me/avege](https://img.shields.io/badge/chat-on%20Telegram-blue.svg)](https://t.me/avege)
+[![GitHub release](https://img.shields.io/github/release/avege/avege.svg?maxAge=2592000)](https://github.com/avege/avege/releases) 
+[![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/avege/avege/master/LICENSE) 
+[![Github Releases Downloads Total](https://img.shields.io/github/downloads/avege/avege/total.svg)](https://github.com/avege/avege/releases)
+[![Go Report Card](https://goreportcard.com/badge/github.com/avege/avege)](https://goreportcard.com/report/github.com/avege/avege)
+[![codebeat badge](https://codebeat.co/badges/630a79a4-2ebf-4e23-8dbd-eb81ae6b078e)](https://codebeat.co/projects/github-com-avege-avege)
 
 ## Feature
 
 * Windows/macOS/Linux/variant BSDs supported
 * socks5 frontend, IPv4/IPv6/remote DNS resolving supported
-* redir mode frontend on Linux (iptables compatible), IPv4 only
+* redir mode frontend on Linux (iptables compatible), IPv4/IPv6(not tested) supported
 * tunnel mode frontend, IPv4/IPv6 supported
 * http/https backend
 * socks4/socks4a/socks5 backend
@@ -63,7 +69,6 @@ Socks5/Transparent Proxy Client
 * Adblock Plus rules based filter for http
 * TCP Fast Open on Linux with 3.7+ kernel
 * Transparent proxy aka. redir mode on Mac OS X and variant BSDs(ipfw/pf mode)
-* IPv6 supported for redir mode
 
 ## Build
 
@@ -78,8 +83,7 @@ go get -u -f -v github.com/gin-gonic/gin
 go get -u -f -v github.com/gorilla/websocket
 go get -u -f -v github.com/DeanThompson/ginpprof
 go get -u -f -v github.com/miekg/dns
-go get -u -f -v github.com/aead/chacha20
-go get -u -f -v github.com/codahale/chacha20
+go get -u -f -v github.com/Yawning/chacha20
 go get -u -f -v github.com/dgryski/go-camellia
 go get -u -f -v github.com/dgryski/go-idea
 go get -u -f -v github.com/dgryski/go-rc2
@@ -93,7 +97,7 @@ go get -u -f -v github.com/ftrvxmtrx/fd
 for macOS/Linux/BSDs
 
 ```shell
-git clone https://github.com/missdeer/avege.git
+git clone https://github.com/avege/avege.git
 cd avege/src/avege
 GOPATH=$GOPATH:$PWD/../.. go build 
 ```
